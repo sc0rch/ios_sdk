@@ -18,6 +18,7 @@
 static NSString   * const kPackageQueueFilename = @"AdjustIoPackageQueue";
 static const char * const kInternalQueueName    = "io.adjust.PackageQueue";
 
+static NSObject *packageQueueOperationsLock = nil;
 
 #pragma mark - private
 @interface ADJPackageHandler()
@@ -40,6 +41,12 @@ static const char * const kInternalQueueName    = "io.adjust.PackageQueue";
 
 #pragma mark -
 @implementation ADJPackageHandler
+
++ (void)initialize {
+    if (self == [ADJPackageHandler class]) {
+        packageQueueOperationsLock = [[NSObject alloc] init];
+    }
+}
 
 - (id)initWithActivityHandler:(id<ADJActivityHandler>)activityHandler
                 startsSending:(BOOL)startsSending
@@ -372,34 +379,37 @@ startsSending:(BOOL)startsSending
 
 #pragma mark - private
 - (void)readPackageQueueI:(ADJPackageHandler *)selfI {
-    [NSKeyedUnarchiver setClass:[ADJActivityPackage class] forClassName:@"AIActivityPackage"];
-    
-    id object = [ADJUtil readObject:kPackageQueueFilename
-                         objectName:@"Package queue"
-                              class:[NSArray class]
-                         syncObject:[ADJPackageHandler class]];
-    
-    if (object != nil) {
-        selfI.packageQueue = object;
-    } else {
-        selfI.packageQueue = [NSMutableArray array];
+    @synchronized(packageQueueOperationsLock) {
+        [NSKeyedUnarchiver setClass:[ADJActivityPackage class] forClassName:@"AIActivityPackage"];
+        
+        id object = [ADJUtil readObject:kPackageQueueFilename
+                             objectName:@"Package queue"
+                                  class:[NSArray class]
+                             syncObject:[ADJPackageHandler class]];
+        
+        if (object != nil) {
+            selfI.packageQueue = object;
+        } else {
+            selfI.packageQueue = [NSMutableArray array];
+        }
     }
-
 }
 
 - (void)writePackageQueueS:(ADJPackageHandler *)selfS {
-    if (selfS.packageQueue == nil) {
-        return;
+    @synchronized(packageQueueOperationsLock) {
+        if (selfS.packageQueue == nil) {
+            return;
+        }
+        
+        [ADJUtil writeObject:selfS.packageQueue
+                    fileName:kPackageQueueFilename
+                  objectName:@"Package queue"
+                  syncObject:[ADJPackageHandler class]];
     }
-    
-    [ADJUtil writeObject:selfS.packageQueue
-                fileName:kPackageQueueFilename
-              objectName:@"Package queue"
-              syncObject:[ADJPackageHandler class]];
 }
 
 - (void)teardownPackageQueueS {
-    @synchronized ([ADJPackageHandler class]) {
+    @synchronized(packageQueueOperationsLock) {
         if (self.packageQueue == nil) {
             return;
         }
