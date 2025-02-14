@@ -703,67 +703,45 @@ authorizationHeader:(NSString *)authorizationHeader
                          activityKind:(ADJActivityKind)activityKind
                             clientSdk:(NSString *)clientSdk
 {
-    Class signerClass = NSClassFromString(@"ADJSigner");
-    if (signerClass == nil) {
-        return;
+    @try {
+        Class signerClass = NSClassFromString(@"ADJSigner");
+        if (!signerClass) {
+            [ADJAdjustFactory.logger error:@"ADJSigner class not found"];
+            return;
+        }
+
+        SEL methodSignatureForSelector = NSSelectorFromString(@"methodSignatureForSelector:");
+        NSMethodSignature *signMethodSignature = [signerClass methodSignatureForSelector:methodSignatureForSelector];
+        if (!signMethodSignature) {
+            [ADJAdjustFactory.logger error:@"Failed to get method signature for signing"];
+            return;
+        }
+
+        NSInvocation *signInvocation = [NSInvocation invocationWithMethodSignature:signMethodSignature];
+        if (!signInvocation) {
+            [ADJAdjustFactory.logger error:@"Failed to create sign invocation"];
+            return;
+        }
+
+        // Safely copy parameters
+        NSMutableDictionary *paramsCopy = [params mutableCopy];
+        
+        [signInvocation setSelector:methodSignatureForSelector];
+        [signInvocation setTarget:signerClass];
+        [signInvocation setArgument:&paramsCopy atIndex:2];
+        
+        @try {
+            [signInvocation invoke];
+        } @catch (NSException *e) {
+            [ADJAdjustFactory.logger error:@"Exception during signature invocation: %@", e];
+        }
+        
+        // Update original dictionary only after successful execution
+        [params setDictionary:paramsCopy];
+        
+    } @catch (NSException *e) {
+        [ADJAdjustFactory.logger error:@"Exception during signing process: %@", e];
     }
-    SEL signSEL = NSSelectorFromString(@"sign:withActivityKind:withSdkVersion:");
-    if (![signerClass respondsToSelector:signSEL]) {
-        return;
-    }
-
-    const char *activityKindChar = [[ADJActivityKindUtil activityKindToString:activityKind] UTF8String];
-    const char *sdkVersionChar = [clientSdk UTF8String];
-
-    // Stack allocated strings to ensure their lifetime stays until the next iteration
-    static char packageActivityKind[64], sdkVersion[64];
-    strncpy(packageActivityKind, activityKindChar, strlen(activityKindChar) + 1);
-    strncpy(sdkVersion, sdkVersionChar, strlen(sdkVersionChar) + 1);
-
-    // NSInvocation setArgument requires lvalue references with exact matching types to the executed function signature.
-    // With this usage we ensure that the lifetime of the object remains until the next iteration, as it points to the
-    // stack allocated string where we copied the buffer.
-    const char *lvalActivityKind = packageActivityKind;
-    const char *lvalSdkVersion = sdkVersion;
-
-    /*
-     [ADJSigner sign:parameters
-    withActivityKind:activityKindChar
-      withSdkVersion:sdkVersionChar];
-     */
-
-    NSMethodSignature *signMethodSignature = [signerClass methodSignatureForSelector:signSEL];
-    NSInvocation *signInvocation = [NSInvocation invocationWithMethodSignature:signMethodSignature];
-    [signInvocation setSelector:signSEL];
-    [signInvocation setTarget:signerClass];
-
-    [signInvocation setArgument:&params atIndex:2];
-    [signInvocation setArgument:&lvalActivityKind atIndex:3];
-    [signInvocation setArgument:&lvalSdkVersion atIndex:4];
-
-    [signInvocation invoke];
-
-    SEL getVersionSEL = NSSelectorFromString(@"getVersion");
-    if (![signerClass respondsToSelector:getVersionSEL]) {
-        return;
-    }
-    /*
-     NSString *signerVersion = [ADJSigner getVersion];
-     */
-    IMP getVersionIMP = [signerClass methodForSelector:getVersionSEL];
-    if (!getVersionIMP) {
-        return;
-    }
-    id (*getVersionFunc)(id, SEL) = (void *)getVersionIMP;
-    id signerVersion = getVersionFunc(signerClass, getVersionSEL);
-    if (![signerVersion isKindOfClass:[NSString class]]) {
-        return;
-    }
-
-    NSString *signerVersionString = (NSString *)signerVersion;
-    [ADJPackageBuilder parameters:params
-                           setString:signerVersionString
-                           forKey:@"native_version"];
 }
 
 @end

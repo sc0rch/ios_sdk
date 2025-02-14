@@ -14,6 +14,7 @@
 #import "ADJBackoffStrategy.h"
 #import "ADJPackageBuilder.h"
 #import "ADJUserDefaults.h"
+#import "ADJPackageStore.h"
 
 static NSString   * const kPackageQueueFilename = @"AdjustIoPackageQueue";
 static const char * const kInternalQueueName    = "io.adjust.PackageQueue";
@@ -36,6 +37,7 @@ static NSObject *packageQueueOperationsLock = nil;
 @property (nonatomic, assign) BOOL isRetrying;
 @property (nonatomic, assign) NSTimeInterval retryStartedAt;
 @property (nonatomic, assign) double totalWaitTime;
+@property (nonatomic, strong) NSLock *packageQueueLock;
 
 @end
 
@@ -62,6 +64,7 @@ static NSObject *packageQueueOperationsLock = nil;
     self.lastPackageRetriesCount = 0;
     self.isRetrying = NO;
     self.totalWaitTime = 0.0;
+    self.packageQueueLock = [[NSLock alloc] init];
 
     [ADJUtil launchInQueue:self.internalQueue
                 selfInject:self
@@ -157,7 +160,9 @@ static NSObject *packageQueueOperationsLock = nil;
 }
 
 - (void)pauseSending {
-    self.paused = YES;
+    dispatch_async(self.internalQueue, ^{
+        self.paused = YES;
+    });
 }
 
 - (void)resumeSending {
@@ -234,80 +239,89 @@ startsSending:(BOOL)startsSending
 - (void)addI:(ADJPackageHandler *)selfI
      package:(ADJActivityPackage *)newPackage
 {
-    if (self.isRetrying == YES) {
-        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-        newPackage.waitBeforeSend = self.totalWaitTime - (now - self.retryStartedAt);
+    [self.packageQueueLock lock];
+    @try {
+        if (self.isRetrying == YES) {
+            NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+            newPackage.waitBeforeSend = self.totalWaitTime - (now - self.retryStartedAt);
+        }
+        [ADJPackageBuilder parameters:newPackage.parameters
+                               setInt:(int)selfI.packageQueue.count
+                               forKey:@"enqueue_size"];
+        [selfI.packageQueue addObject:newPackage];
+
+        [selfI.logger debug:@"Added package %d (%@)", selfI.packageQueue.count, newPackage];
+        [selfI.logger verbose:@"%@", newPackage.extendedString];
+
+        [selfI writePackageQueueS:selfI];
+    } @finally {
+        [self.packageQueueLock unlock];
     }
-    [ADJPackageBuilder parameters:newPackage.parameters
-                           setInt:(int)selfI.packageQueue.count
-                           forKey:@"enqueue_size"];
-    [selfI.packageQueue addObject:newPackage];
-
-    [selfI.logger debug:@"Added package %d (%@)", selfI.packageQueue.count, newPackage];
-    [selfI.logger verbose:@"%@", newPackage.extendedString];
-
-    [selfI writePackageQueueS:selfI];
 }
 
 - (void)sendFirstI:(ADJPackageHandler *)selfI
 {
-    NSUInteger queueSize = selfI.packageQueue.count;
-    if (queueSize == 0) return;
+    @try {
+        NSUInteger queueSize = selfI.packageQueue.count;
+        if (queueSize == 0) return;
 
-    if (selfI.paused) {
-        [selfI.logger debug:@"Package handler is paused"];
-        return;
-    }
+        if (selfI.paused) {
+            [selfI.logger debug:@"Package handler is paused"];
+            return;
+        }
 
-    if (dispatch_semaphore_wait(selfI.sendingSemaphore, DISPATCH_TIME_NOW) != 0) {
-        [selfI.logger verbose:@"Package handler is already sending"];
-        return;
-    }
+        if (dispatch_semaphore_wait(selfI.sendingSemaphore, 
+                                   dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) != 0) {
+            [selfI.logger error:@"Timeout waiting for semaphore"];
+            return;
+        }
 
-    ADJActivityPackage *activityPackage = [selfI.packageQueue objectAtIndex:0];
-    if (![activityPackage isKindOfClass:[ADJActivityPackage class]]) {
-        [selfI.logger error:@"Failed to read activity package"];
-        [selfI sendNextI:selfI];
-        return;
-    }
+        ADJActivityPackage *activityPackage = [selfI.packageQueue objectAtIndex:0];
+        if (![activityPackage isKindOfClass:[ADJActivityPackage class]]) {
+            [selfI.logger error:@"Failed to read activity package"];
+            [selfI sendNextI:selfI];
+            return;
+        }
 
-    NSMutableDictionary *sendingParameters = [NSMutableDictionary dictionaryWithCapacity:2];
-    if (queueSize - 1 > 0) {
+        NSMutableDictionary *sendingParameters = [NSMutableDictionary dictionaryWithCapacity:2];
+        if (queueSize - 1 > 0) {
+            [ADJPackageBuilder parameters:sendingParameters
+                                   setInt:(int)queueSize - 1
+                                   forKey:@"queue_size"];
+        }
         [ADJPackageBuilder parameters:sendingParameters
-                               setInt:(int)queueSize - 1
-                               forKey:@"queue_size"];
+                            setString:[ADJUtil formatSeconds1970:[NSDate.date timeIntervalSince1970]]
+                               forKey:@"sent_at"];
+
+        [ADJPackageBuilder parameters:sendingParameters
+                               setInt:(int)activityPackage.errorCount
+                               forKey:@"retry_count"];
+        [ADJPackageBuilder parameters:sendingParameters
+             setNumberWithoutRounding:activityPackage.firstErrorCode
+                               forKey:@"first_error"];
+        [ADJPackageBuilder parameters:sendingParameters
+             setNumberWithoutRounding:activityPackage.lastErrorCode
+                               forKey:@"last_error"];
+        [ADJPackageBuilder parameters:sendingParameters
+                            setDouble:self.totalWaitTime
+                               forKey:@"wait_total"];
+        [ADJPackageBuilder parameters:sendingParameters
+                            setDouble:activityPackage.waitBeforeSend
+                               forKey:@"wait_time"];
+
+        [selfI.requestHandler sendPackageByPOST:activityPackage
+                              sendingParameters:[sendingParameters copy]];
+    } @catch (NSException *ex) {
+        [selfI.logger error:@"Exception in sendFirstI: %@", ex];
+        dispatch_semaphore_signal(selfI.sendingSemaphore);
     }
-    [ADJPackageBuilder parameters:sendingParameters
-                        setString:[ADJUtil formatSeconds1970:[NSDate.date timeIntervalSince1970]]
-                           forKey:@"sent_at"];
-
-    [ADJPackageBuilder parameters:sendingParameters
-                           setInt:(int)activityPackage.errorCount
-                           forKey:@"retry_count"];
-    [ADJPackageBuilder parameters:sendingParameters
-         setNumberWithoutRounding:activityPackage.firstErrorCode
-                           forKey:@"first_error"];
-    [ADJPackageBuilder parameters:sendingParameters
-         setNumberWithoutRounding:activityPackage.lastErrorCode
-                           forKey:@"last_error"];
-    [ADJPackageBuilder parameters:sendingParameters
-                        setDouble:self.totalWaitTime
-                           forKey:@"wait_total"];
-    [ADJPackageBuilder parameters:sendingParameters
-                        setDouble:activityPackage.waitBeforeSend
-                           forKey:@"wait_time"];
-
-    [selfI.requestHandler sendPackageByPOST:activityPackage
-                          sendingParameters:[sendingParameters copy]];
 }
 
 - (void)sendNextI:(ADJPackageHandler *)selfI {
     if ([selfI.packageQueue count] > 0) {
+        [[ADJPackageStore sharedInstance] removePackageAtIndex:0];
         [selfI.packageQueue removeObjectAtIndex:0];
-        [selfI writePackageQueueS:selfI];
     } else {
-        // at this point, the queue has been emptied
-        // reset total_wait in this moment to allow all requests to populate total_wait
         selfI.totalWaitTime = 0.0;
     }
 
@@ -373,25 +387,15 @@ startsSending:(BOOL)startsSending
 }
 
 - (void)flushI:(ADJPackageHandler *)selfI {
+    [[ADJPackageStore sharedInstance] clearAllPackages];
     [selfI.packageQueue removeAllObjects];
-    [selfI writePackageQueueS:selfI];
 }
 
 #pragma mark - private
 - (void)readPackageQueueI:(ADJPackageHandler *)selfI {
-    @synchronized(packageQueueOperationsLock) {
-        [NSKeyedUnarchiver setClass:[ADJActivityPackage class] forClassName:@"AIActivityPackage"];
-        
-        id object = [ADJUtil readObject:kPackageQueueFilename
-                             objectName:@"Package queue"
-                                  class:[NSArray class]
-                             syncObject:[ADJPackageHandler class]];
-        
-        if (object != nil) {
-            selfI.packageQueue = object;
-        } else {
-            selfI.packageQueue = [NSMutableArray array];
-        }
+    selfI.packageQueue = [[ADJPackageStore sharedInstance] loadPackages].mutableCopy;
+    if (!selfI.packageQueue) {
+        selfI.packageQueue = [NSMutableArray array];
     }
 }
 
@@ -401,10 +405,11 @@ startsSending:(BOOL)startsSending
             return;
         }
         
-        [ADJUtil writeObject:selfS.packageQueue
-                    fileName:kPackageQueueFilename
-                  objectName:@"Package queue"
-                  syncObject:[ADJPackageHandler class]];
+        // Write only the last added package
+        ADJActivityPackage *lastPackage = [selfS.packageQueue lastObject];
+        if (lastPackage) {
+            [[ADJPackageStore sharedInstance] addPackage:lastPackage];
+        }
     }
 }
 
