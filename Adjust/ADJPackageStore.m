@@ -53,79 +53,108 @@
 }
 
 - (void)migrateFromPlistIfNeeded {
-    // Get path to old file in Application Support directory
-    NSString *plistPath = [self getFilePathInAppSupportDir:@"AdjustIoPackageQueue"];
-    
-    // Check if old file exists
-    if (![[NSFileManager defaultManager] fileExistsAtPath:plistPath]) {
-        return;
+  NSString *plistPath = [self getFilePathInAppSupportDir:@"AdjustIoPackageQueue"];
+  if (![[NSFileManager defaultManager] fileExistsAtPath:plistPath]) {
+    return;
+  }
+
+  // Прочитать массив oldPackages (NSKeyedUnarchiver) можно и вне dbQueue,
+  // но саму транзакцию и вставки нужно поместить в dispatch_sync на dbQueue.
+  NSData *plistData = [NSData dataWithContentsOfFile:plistPath];
+  NSArray *oldPackages = [NSKeyedUnarchiver unarchiveObjectWithData:plistData];
+  if (![oldPackages isKindOfClass:[NSArray class]]) {
+    return;
+  }
+
+  dispatch_sync(self.dbQueue, ^{
+    // Запускаем транзакцию *внутри* dbQueue
+    if (sqlite3_exec(self->_database, "BEGIN TRANSACTION;", NULL, NULL, NULL) != SQLITE_OK) {
+      [self.logger error:@"Failed to begin transaction for migration"];
+      return;
     }
-    
+
+    BOOL migrationSuccessful = YES;
     @try {
-        // Read data from old file
-        NSData *plistData = [NSData dataWithContentsOfFile:plistPath];
-        if (!plistData) {
-            [self.logger debug:@"No data found in old package queue file"];
-            return;
+      for (ADJActivityPackage *pkg in oldPackages) {
+        // Здесь можно вызвать *внутренний* метод вставки без dispatch_async,
+        // или же сделать тело вставки прямо тут, чтобы гарантировать, что
+        // все INSERT идут синхронно в рамках одной транзакции.
+        if (![self insertPackageSync:pkg]) {
+          migrationSuccessful = NO;
+          break;
         }
-        
-        NSArray *oldPackages = [NSKeyedUnarchiver unarchiveObjectWithData:plistData];
-        if (!oldPackages || ![oldPackages isKindOfClass:[NSArray class]]) {
-            [self.logger error:@"Failed to unarchive old package queue"];
-            return;
-        }
-        
-        // Start transaction for migration
-        const char *beginTransaction = "BEGIN TRANSACTION;";
-        if (sqlite3_exec(_database, beginTransaction, NULL, NULL, NULL) != SQLITE_OK) {
-            [self.logger error:@"Failed to begin transaction for migration"];
-            return;
-        }
-        
-        // Migrate each package
-        BOOL migrationSuccessful = YES;
-        for (ADJActivityPackage *package in oldPackages) {
-            if (![package isKindOfClass:[ADJActivityPackage class]]) {
-                continue;
-            }
-            
-            @try {
-                [self addPackage:package];
-            } @catch (NSException *exception) {
-                [self.logger error:@"Failed to migrate package: %@", exception];
-                migrationSuccessful = NO;
-                break;
-            }
-        }
-        
-        if (migrationSuccessful) {
-            // Complete transaction
-            const char *commitTransaction = "COMMIT;";
-            if (sqlite3_exec(_database, commitTransaction, NULL, NULL, NULL) == SQLITE_OK) {
-                // Delete old file only after successful migration
-                NSError *error = nil;
-                if ([[NSFileManager defaultManager] removeItemAtPath:plistPath error:&error]) {
-                    [self.logger debug:@"Successfully migrated %lu packages from plist to SQLite", 
-                                     (unsigned long)oldPackages.count];
-                } else {
-                    [self.logger error:@"Failed to remove old package queue file: %@", error];
-                }
-            } else {
-                [self.logger error:@"Failed to commit migration transaction"];
-                const char *rollbackTransaction = "ROLLBACK;";
-                sqlite3_exec(_database, rollbackTransaction, NULL, NULL, NULL);
-            }
+      }
+      if (migrationSuccessful) {
+        if (sqlite3_exec(self->_database, "COMMIT;", NULL, NULL, NULL) == SQLITE_OK) {
+          [[NSFileManager defaultManager] removeItemAtPath:plistPath error:nil];
         } else {
-            // Rollback transaction in case of error
-            const char *rollbackTransaction = "ROLLBACK;";
-            sqlite3_exec(_database, rollbackTransaction, NULL, NULL, NULL);
-            [self.logger error:@"Migration failed, rolling back changes"];
+          sqlite3_exec(self->_database, "ROLLBACK;", NULL, NULL, NULL);
         }
-    } @catch (NSException *exception) {
-        [self.logger error:@"Exception during migration: %@", exception];
-        const char *rollbackTransaction = "ROLLBACK;";
-        sqlite3_exec(_database, rollbackTransaction, NULL, NULL, NULL);
+      } else {
+        sqlite3_exec(self->_database, "ROLLBACK;", NULL, NULL, NULL);
+      }
+    } @catch (NSException *ex) {
+      sqlite3_exec(self->_database, "ROLLBACK;", NULL, NULL, NULL);
     }
+  });
+}
+
+- (BOOL)insertPackageSync:(ADJActivityPackage *)package {
+  if (!package) {
+    [self.logger error:@"insertPackageSync called with nil package"];
+    return NO;
+  }
+
+  NSData *packageData = nil;
+
+  // Архивируем package
+  if (@available(iOS 11.0, tvOS 11.0, *)) {
+    NSError *error = nil;
+    packageData = [NSKeyedArchiver archivedDataWithRootObject:package
+                                        requiringSecureCoding:NO
+                                                        error:&error];
+    if (error) {
+      [self.logger error:@"Failed to archive package: %@", error];
+      return NO;
+    }
+  } else {
+    @try {
+      packageData = [NSKeyedArchiver archivedDataWithRootObject:package];
+    } @catch (NSException *exception) {
+      [self.logger error:@"Failed to archive package: %@", exception];
+      return NO;
+    }
+  }
+
+  if (!packageData) {
+    [self.logger error:@"Failed to create package data"];
+    return NO;
+  }
+
+  const char *sql = "INSERT INTO packages (package_data) VALUES (?);";
+  sqlite3_stmt *statement = NULL;
+
+  // Подготовим запрос
+  if (sqlite3_prepare_v2(self->_database, sql, -1, &statement, NULL) == SQLITE_OK) {
+    // Привязываем blob
+    sqlite3_bind_blob(statement, 1, [packageData bytes], (int)[packageData length], SQLITE_TRANSIENT);
+
+    // Выполняем запрос
+    if (sqlite3_step(statement) != SQLITE_DONE) {
+      [self.logger error:@"Failed to insert package: %s", sqlite3_errmsg(self->_database)];
+      sqlite3_finalize(statement);
+      return NO;
+    }
+    // Всё успешно
+    sqlite3_finalize(statement);
+    return YES;
+  } else {
+    [self.logger error:@"Failed to prepare statement: %s", sqlite3_errmsg(self->_database)];
+    if (statement) {
+      sqlite3_finalize(statement);
+    }
+    return NO;
+  }
 }
 
 // Helper method to get file path in Application Support directory
@@ -195,17 +224,21 @@
 }
 
 - (void)removePackageAtIndex:(NSUInteger)index {
+  dispatch_async(self.dbQueue, ^{
     const char *sql = "DELETE FROM packages WHERE id IN (SELECT id FROM packages LIMIT 1 OFFSET ?);";
     sqlite3_stmt *statement;
-    
+
     if (sqlite3_prepare_v2(_database, sql, -1, &statement, NULL) == SQLITE_OK) {
-        sqlite3_bind_int(statement, 1, (int)index);
-        
-        if (sqlite3_step(statement) != SQLITE_DONE) {
-            [self.logger error:@"Failed to remove package"];
-        }
+      sqlite3_bind_int(statement, 1, (int)index);
+
+      if (sqlite3_step(statement) != SQLITE_DONE) {
+        [self.logger error:@"Failed to remove package"];
+      }
+    } else {
+      [self.logger error:@"Failed to prepare statement: %s", sqlite3_errmsg(_database)];
     }
     sqlite3_finalize(statement);
+  });
 }
 
 - (NSArray<ADJActivityPackage *> *)loadPackages {
@@ -263,13 +296,15 @@
 }
 
 - (void)clearAllPackages {
+  dispatch_async(self.dbQueue, ^{
     const char *sql = "DELETE FROM packages;";
     char *errMsg;
-    
+
     if (sqlite3_exec(_database, sql, NULL, NULL, &errMsg) != SQLITE_OK) {
-        [self.logger error:@"Failed to clear packages: %s", errMsg];
-        sqlite3_free(errMsg);
+      [self.logger error:@"Failed to clear packages: %s", errMsg];
+      sqlite3_free(errMsg);
     }
+  });
 }
 
 - (void)dealloc {
