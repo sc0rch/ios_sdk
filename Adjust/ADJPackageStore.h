@@ -6,10 +6,19 @@
 + (instancetype)sharedInstance;
 
 - (void)addPackage:(ADJActivityPackage *)package;
-- (void)removePackage:(ADJActivityPackage *)package;
-- (void)removePackageAtIndex:(NSUInteger)index;
-- (NSArray<ADJActivityPackage *> *)loadPackages;
-- (void)clearAllPackages;
-- (void)updatePackages:(NSArray<ADJActivityPackage *> *)packages;
 
-@end 
+- (void)removePackageAtIndex:(NSUInteger)index;
+
+- (NSArray<ADJActivityPackage *> *)loadPackages;
+
+- (void)clearAllPackages;
+
+- (NSUInteger)count;
+
+- (ADJActivityPackage *)packageAtIndex:(NSUInteger)index;
+
+- (BOOL)updatePackage:(ADJActivityPackage *)package atIndex:(NSUInteger)index;
+
+- (void)updatePackages:(void (^)(ADJActivityPackage *package))updateBlock;
+
+@end
