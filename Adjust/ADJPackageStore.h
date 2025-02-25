@@ -7,6 +7,10 @@
 
 - (void)addPackage:(ADJActivityPackage *)package;
 
+- (void)batchAddPackages:(NSArray<ADJActivityPackage *> *)packages;
+
+- (void)flushCache;
+
 - (void)removePackageAtIndex:(NSUInteger)index;
 
 - (NSArray<ADJActivityPackage *> *)loadPackages;
