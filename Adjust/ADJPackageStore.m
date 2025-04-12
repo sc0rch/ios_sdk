@@ -2,6 +2,7 @@
 #import <sqlite3.h>
 #import "ADJLogger.h"
 #import "ADJAdjustFactory.h"
+#import <UIKit/UIKit.h>
 
 @interface ADJPackageStore()
 
